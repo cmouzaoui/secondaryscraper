@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+import csv
+from enum import Enum
+import re
+from bs4 import BeautifulSoup
+
+SOURCE_HTML = "Medical School Secondary Essay Prompts (Updated for 2022–2023 Cycle) — Shemmassian Academic Consulting.html"
+PROMPT_REGEX = re.compile(r"(.*) \(([0-9]+) (words|characters)\)")
+CYCLE_REGEX = re.compile("[0-9-–]+")
+OUTPUT_NAME = "secondaries.csv"
+
+Token = Enum("Token", ["STATE", "SCHOOL", "CYCLE", "PROMPT_OL", "FLAT_PROMPT", "TSC"])
+
+
+class SchoolPhraseError(Exception):
+    pass
+
+
+def parse_prompt(prompt):
+    if not isinstance(prompt, str):
+        print(f"Not a string: {prompt}")
+        return None
+    match = PROMPT_REGEX.fullmatch(prompt)
+    if match is None:
+        return (prompt, "", "")
+    return (match.group(1), match.group(2), match.group(3))
+
+
+def tag_paragraph(token):
+    n_contents = len(token.contents)
+    if (
+        # (n_contents == 1 or (n_contents == 2 and token.contents[1].string == "*"))
+        # and
+        token.a is not None
+        and token.a.strong is not None
+        and len(token.a.contents) == 1
+        and token.a.strong.string is not None
+    ):
+        return (Token.SCHOOL, token.a.strong.string)
+    if (
+        token.strong is not None
+        and token.strong.string == "Time-sensitive considerations: "
+    ):
+        return (Token.TSC, "".join(list(token.strings)[1:]))
+    if token.string is not None:
+        match = CYCLE_REGEX.fullmatch(token.string)
+        if match:
+            return (Token.CYCLE, token.string)
+        return (Token.FLAT_PROMPT, token.string)
+    return None
+
+
+def tag_element(token):
+    # state is in h2.strong
+    # school is in p.a.strong
+    # cycle is in p, matches regex [0-9-]+
+    # prompt list is ol
+    if token.string == "----":
+        return None
+    if token.name == "h2" and hasattr(token, "strong"):
+        return (Token.STATE, token.strong.string)
+    if token.name == "p":
+        return tag_paragraph(token)
+    if token.name == "ol":
+        return (
+            Token.PROMPT_OL,
+            [
+                child
+                for child in token.contents
+                if child.name == "li" and child.p.string is not None
+            ],
+        )
+    return None
+
+
+def parse_zero_or_more_aux(parser, token_test, tokens, parsed):
+    if not tokens:
+        return (parsed, tokens)
+    if not token_test(tokens[0][0]):
+        return (parsed, tokens)
+    new_phrase, remaining = parser(tokens)
+    return parse_zero_or_more_aux(parser, token_test, remaining, parsed + [new_phrase])
+
+
+def parse_zero_or_more(parser, token_test, tokens):
+    """parser: function that takes tokens and returns tuple: new phrase (or"""
+    return parse_zero_or_more_aux(parser, token_test, tokens, [])
+
+
+def parse_state_group(tokens):
+    """grammar:
+    state_group = STATE (SCHOOL school_phrase)*
+    school_phrase = TSC cycle_predicate | cycle_predicate
+    cycle_predicate = CYCLE (PROMPT_OL | FLAT_PROMPT)*
+    """
+    if tokens[0][0] != Token.STATE:
+        print("No state: ", tokens)
+        return ((None, []), tokens)
+    state = tokens[0][1]
+    school_phrases, remaining = parse_zero_or_more(
+        parse_school_phrase, lambda t: t == Token.SCHOOL, tokens[1:]
+    )
+    return ((state, school_phrases), remaining)
+
+
+def parse_prompt_element(tokens):
+    if not tokens:
+        print("No tokens to parse prompt list group")
+        return ([], tokens)
+    if tokens[0][0] not in [Token.PROMPT_OL, Token.FLAT_PROMPT]:
+        print("No prompts in token: ", tokens[0])
+        return ([], tokens)
+    if tokens[0][0] == Token.PROMPT_OL:
+        prompts = parse_prompt_list(tokens[0][1])
+    elif tokens[0][0] == Token.FLAT_PROMPT:
+        prompts = [(tokens[0][1].string, "", "")]
+    return prompts, tokens[1:]
+
+
+def skip_broken_school_phrase(tokens):
+    next_school = [
+        i + 1 for i, token in enumerate(tokens[1:]) if token[0] == Token.SCHOOL
+    ]
+    if not next_school:
+        print("Cannot parse rest of school phrase", tokens)
+        return []
+    print(
+        "Cannot parse school phrase:",
+        tokens[0 : next_school[0]],
+    )
+    return tokens[next_school[0] :]
+
+
+def parse_cycle_predicate(tokens):
+    cycle = tokens[0][1]
+    prompt_elements, remaining = parse_zero_or_more(
+        parse_prompt_element,
+        lambda t: t in (Token.PROMPT_OL, Token.FLAT_PROMPT),
+        tokens[1:],
+    )
+    return (
+        (cycle, [p for prompt_element in prompt_elements for p in prompt_element]),
+        remaining,
+    )
+
+
+def parse_school_phrase(tokens):
+    school = tokens[0][1]
+    if tokens[1][0] == Token.TSC:
+        tsc = tokens[1][1]
+        cycle_predicate, remaining = parse_cycle_predicate(tokens[2:])
+        return ((school, tsc, cycle_predicate), remaining)
+    cycle_predicate, remaining = parse_cycle_predicate(tokens[1:])
+    return ((school, None, cycle_predicate), remaining)
+
+
+def parse_state(state):
+    try:
+        tokens = list(filter(None, [tag_element(ele) for ele in state.contents]))
+    except Exception as e:
+        print("Cannot tokenize state, ", state.contents)
+        raise e
+    if not tokens:
+        return (None, [])
+    try:
+        state_group, remaining = parse_state_group(tokens)
+        if remaining:
+            print("Remaining tokens for state: ", state_group[0])
+            print(remaining)
+        return state_group
+    except Exception as e:
+        print("Cannot parse tokens: ", tokens)
+        raise e
+
+
+def process_state(state_raw):
+    try:
+        state, school_groups = parse_state(state_raw)
+    except Exception as e:
+        print("Error processing state: ", e)
+        # return []
+        raise e
+    return [
+        ((state, tsc, school, cycle) + prompt)
+        for school, tsc, (cycle, prompts) in school_groups
+        for prompt in prompts
+    ]
+
+
+def parse_prompt_list(prompt_list):
+    return list(
+        filter(None, [parse_prompt(line_item.p.string) for line_item in prompt_list])
+    )
+
+
+def main():
+    with open(SOURCE_HTML, "r", encoding="utf8") as html_doc:
+        soup = BeautifulSoup(html_doc, "html.parser")
+    states_raw = soup.find_all(name="div", attrs={"class": "sqs-block-content"})
+    entries = [entry for state in states_raw for entry in process_state(state)]
+    with open(OUTPUT_NAME, "w", encoding="utf8") as out:
+        writer = csv.writer(out)
+        writer.writerow(
+            [
+                "State",
+                "Time-Sensitive Consideration",
+                "Cycle",
+                "School",
+                "Prompt",
+                "Limit",
+                "Unit",
+            ]
+        )
+        writer.writerows(entries)
+
+
+if __name__ == "__main__":
+    main()
